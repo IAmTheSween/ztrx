@@ -1740,4 +1740,68 @@ mod barycentric_tests {
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
+
+    #[test]
+    fn fma_mix_f16_ignores_dead_first_half_of_interpolation() {
+        let [e0, e1] = exp_mrt0(4);
+        // v_interp_p1ll_f16 v2, v0, attr0.x; v_interp_p2_f16 v3, v1, attr0.x, v2
+        // v_interp_p1ll_f16 v5, v0, attr0.x; v_interp_p2_f16 v6, v1, attr0.x, v5
+        // Overwrite v2 low half (mixlo) and v5 high half (mixhi) while their
+        // old values still hold the unpaired first halves, then read each back
+        // through v_fma_mix_f32 into v4.
+        let words = [
+            0xD742_0002,
+            0x0002_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+            0xD75A_0003,
+            0x040A_0200, // v_interp_p2_f16 v3, v1, attr0.x, v2
+            0xD742_0005,
+            0x0002_0000, // v_interp_p1ll_f16 v5, v0, attr0.x
+            0xD75A_0006,
+            0x0416_0200, // v_interp_p2_f16 v6, v1, attr0.x, v5
+            0xCC21_0002,
+            0x0201_E503, // v_fma_mixlo_f16 v2, v3, 1.0, 0
+            0xCC22_0005,
+            0x0201_E506, // v_fma_mixhi_f16 v5, v6, 1.0, 0
+            0xCC20_6004,
+            (1 << 27) | (0x105 << 18) | (0xF2 << 9) | 0x102, // v_fma_mix_f32 v4, sel_lo(v2), 1.0, sel_hi(v5)
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![PsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0b1111,
+                    attr: 0,
+                    flat: false,
+                    fp16: true,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: PERSP_CENTER,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        validate(&shader);
+    }
 }

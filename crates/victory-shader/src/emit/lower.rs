@@ -7038,22 +7038,21 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
-                let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
-                    None => self.s.m.i32(0),
-                };
                 let h = self
                     .s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
-                let (keep, h) = if name == "v_fma_mixhi_f16" {
-                    let k16 = self.s.m.i32(16);
-                    (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
+                let x = if name == "v_fma_mixhi_f16" {
+                    let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                        Some(Ok(o)) => o,
+                        _ => self.s.m.i32(0),
+                    };
+                    let (keep, k16) = (self.s.m.i32(0xFFFF), self.s.m.i32(16));
+                    let old = self.s.m.bin(c, Bin::And, old, keep);
+                    let h = self.s.m.bin(c, Bin::Shl, h, k16);
+                    self.s.m.bin(c, Bin::Or, old, h)
                 } else {
-                    (0xFFFF_0000, h)
+                    self.low_half(inst, reg, h)
                 };
-                let keep = self.s.m.i32(keep);
-                let old = self.s.m.bin(c, Bin::And, old, keep);
-                let x = self.s.m.bin(c, Bin::Or, old, h);
                 self.write(inst, Reg::V(reg), x, guard);
                 Ok(())
             }
