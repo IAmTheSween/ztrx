@@ -1740,4 +1740,58 @@ mod barycentric_tests {
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
+
+    #[test]
+    fn image_get_lod_array_leaves_slice_undef() {
+        let [e0, e1] = exp_mrt0(0);
+        for dim in [4u32, 5] {
+            let words = [
+                0xBE81_0380, // s_mov_b32 s1, 0 (table address high)
+                0xF40C_0200,
+                0xFA00_0000, // s_load_dwordx8 s[8:15], s[0:1], 0
+                0xF408_0400,
+                0xFA00_0020, // s_load_dwordx4 s[16:19], s[0:1], 0x20
+                0x7E00_02F0, // v_mov_b32 v0, 0.5
+                0x7E02_02F0, // v_mov_b32 v1, 0.5
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xF180_0100 | (dim << 3),
+                0x0082_0000, // image_get_lod v0, v[0:2], s[8:15], s[16:19] dmask:0x1
+                e0,
+                e1,
+                S_ENDPGM,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![crate::native::RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let mut target = element("SV_Target", 16, 0);
+            target.usage = 15;
+            let osg1 = container::signature(&[target], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.code, false, native.vgprs).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
+            validate(&shader);
+        }
+    }
 }

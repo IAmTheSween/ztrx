@@ -9196,6 +9196,11 @@ impl<'a> Lower<'a> {
                     return Err("an image result");
                 };
                 let f32t = self.s.t.f32;
+                // `calculateLOD` takes only the texture's spatial coordinates;
+                // an array slice in `cs[spatial]` makes dxil.dll reject the
+                // call with "out of bound coord must be undef."
+                let mut lod_cs = [fu; 3];
+                lod_cs[..spatial].copy_from_slice(&cs[..spatial]);
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let lod = self.s.op(
@@ -9204,7 +9209,7 @@ impl<'a> Lower<'a> {
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        &[h, sh, lod_cs[0], lod_cs[1], lod_cs[2], clamped],
                     );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
