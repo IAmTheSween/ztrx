@@ -986,6 +986,36 @@ mod tests {
         assert!(e.contains("a carry-in from an untracked mask"), "{e}");
     }
 
+    #[test]
+    fn a_parked_mask_pair_survives_scalar_reuse_of_its_lane() {
+        let body = [
+            0xBE82_047E,             // s_mov_b64 s[2:3], exec
+            0x7D84_0080,             // v_cmp_eq_u32 vcc, 0, v0
+            0xBF86_000C,             // s_cbranch_vccz -> else (15)
+            0xBE84_047E,             // s_mov_b64 s[4:5], exec
+            0xD761_0002,
+            (129 << 9) | 4,          // v_writelane_b32 v2, s4, 1
+            0xBE86_0389,             // s_mov_b32 s6, 9
+            0xD761_0002,
+            (130 << 9) | 5,          // v_writelane_b32 v2, s5, 2
+            0xBE84_0480,             // s_mov_b64 s[4:5], 0
+            0xD760_0004,
+            (129 << 9) | (256 + 2),  // v_readlane_b32 s4, v2, 1
+            0xD760_0005,
+            (130 << 9) | (256 + 2),  // v_readlane_b32 s5, v2, 2
+            0xBF82_0001,             // s_branch -> join (16)
+            0xBE84_047E,             // 15: s_mov_b64 s[4:5], exec
+            0xBEFE_0404,             // 16: s_mov_b64 exec, s[4:5]
+            0xBE87_038B,             // s_mov_b32 s7, 11
+            0xD761_0002,
+            (129 << 9) | 7,          // v_writelane_b32 v2, s7, 1
+            0xD760_0007,
+            (129 << 9) | (256 + 2),  // v_readlane_b32 s7, v2, 1
+            0x7E02_0207,             // v_mov_b32 v1, s7
+        ];
+        stores_v1(&body).unwrap();
+    }
+
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {

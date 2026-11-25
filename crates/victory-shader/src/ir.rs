@@ -243,9 +243,11 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
 /// waves could not do where not every lane runs (the lane may be in the other
 /// wave, or not running).
 /// A register pair parked in two neighbouring lanes (a lane mask, a 64-bit
-/// address) moves as a pair (`s_mov_b64`) when every save and every restore
-/// of the two lanes come together, so a parked lane mask comes back as the
-/// mask it is; otherwise its halves come back as two scalars.
+/// address) moves as a pair (`s_mov_b64`) wherever the save or restore of the
+/// lower lane is followed in the same block by the upper lane with the next
+/// register, even if another lifetime reuses one of those lanes as a single
+/// scalar elsewhere in the program. Any unpaired save or restore keeps its
+/// `s_mov_b32` on the lane's assigned register.
 fn unspill(
     list: &mut [gfx10::Instruction],
     leaders: &[usize],
@@ -385,20 +387,28 @@ fn unspill(
             None
         }
     };
-    let mut pairs: Vec<(u8, u32)> = Vec::new();
-    for &(reg, lane) in &slots {
-        if !wave64 || pairs.iter().any(|&(r, l)| r == reg && l + 1 == lane) || !slots.contains(&(reg, lane + 1)) {
-            continue;
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    let mut links: Vec<(u8, u32)> = Vec::new();
+    if wave64 {
+        let mut paired = vec![false; list.len()];
+        for i in 0..list.len() {
+            if paired[i] {
+                continue;
+            }
+            if let Some(j) = partner(i)
+                && !paired[j]
+            {
+                let (_, reg, _, lane) = parks[i].unwrap();
+                if slots.contains(&(reg, lane + 1)) {
+                    paired[i] = true;
+                    paired[j] = true;
+                    pairs.push((i, j));
+                    links.push((reg, lane));
+                }
+            }
         }
-        let lower: Vec<usize> = (0..list.len()).filter(|&i| parks[i].is_some_and(|p| (p.1, p.3) == (reg, lane))).collect();
-        let upper = parks.iter().flatten().filter(|p| (p.1, p.3) == (reg, lane + 1)).count();
-        let partners: Vec<Option<usize>> = lower.iter().map(|&i| partner(i)).collect();
-        let mut distinct: Vec<usize> = partners.iter().flatten().copied().collect();
-        distinct.sort_unstable();
-        distinct.dedup();
-        if partners.iter().all(Option::is_some) && distinct.len() == lower.len() && upper == lower.len() {
-            pairs.push((reg, lane));
-        }
+        links.sort_unstable();
+        links.dedup();
     }
     // Codes for the parked scalars: the trap temporaries (108..=123), then
     // user SGPRs the program never names, from the top, then the codes past
@@ -412,23 +422,46 @@ fn unspill(
     }
     free[past..255].fill(true);
     let mut codes: Vec<((u8, u32), u8)> = Vec::new();
-    for &(reg, lane) in &pairs {
-        let at = (108..123).chain((0..104).rev()).chain(past..254).find(|&c| free[c] && free[c + 1]);
-        // Not enough spare codes: leave the program as it is.
-        let Some(c) = at else { return Vec::new() };
-        (free[c], free[c + 1]) = (false, false);
-        codes.push(((reg, lane), c as u8));
-        codes.push(((reg, lane + 1), c as u8 + 1));
+    let alloc = |len: usize, free: &mut [bool; 256]| -> Option<u8> {
+        let fit = |c: usize, free: &[bool; 256]| (c..c + len).all(|k| free[k]);
+        let at = (108..=124usize.saturating_sub(len))
+            .chain((0..=105usize.saturating_sub(len)).rev())
+            .chain(past..=255usize.saturating_sub(len))
+            .find(|&c| fit(c, free))?;
+        free[at..at + len].fill(false);
+        Some(at as u8)
+    };
+    // Allocate contiguous runs of paired lanes first so every pair `(lane, lane + 1)`
+    // gets consecutive scalar codes `(c, c + 1)`.
+    let mut s = 0;
+    while s < slots.len() {
+        let (reg, start) = slots[s];
+        let mut e = s;
+        while e + 1 < slots.len()
+            && slots[e + 1] == (reg, slots[e].1 + 1)
+            && links.contains(&(reg, slots[e].1))
+        {
+            e += 1;
+        }
+        let len = e - s + 1;
+        if len > 1 {
+            let Some(c) = alloc(len, &mut free) else {
+                return Vec::new();
+            };
+            for k in 0..len {
+                codes.push(((reg, start + u32::try_from(k).unwrap()), c + k as u8));
+            }
+        }
+        s = e + 1;
     }
     for &slot in &slots {
         if codes.iter().any(|c| c.0 == slot) {
             continue;
         }
-        let Some(c) = (108..=123).chain((0..105).rev()).chain(past..255).find(|&c| free[c]) else {
+        let Some(c) = alloc(1, &mut free) else {
             return Vec::new();
         };
-        free[c] = false;
-        codes.push((slot, c as u8));
+        codes.push((slot, c));
     }
     let code_of = |reg: u8, lane: u32| codes.iter().find(|c| c.0 == (reg, lane)).map(|c| c.1);
     let put = |list: &mut [gfx10::Instruction], i: usize, encoding, opcode: u16, word: u32| {
@@ -445,22 +478,25 @@ fn unspill(
     let mov = |wide: bool, dst: u8, src: u8| 0xBE80_0000 | field(dst) << 16 | (3 + u32::from(wide)) << 8 | field(src);
     const NOP: u32 = 0xBF80_0000;
     let mut edits: Vec<(usize, Option<(bool, u8, u8)>)> = Vec::new();
+    let mut partner_of = vec![None; list.len()];
+    let mut paired_upper = vec![false; list.len()];
+    for &(i, j) in &pairs {
+        partner_of[i] = Some(j);
+        paired_upper[j] = true;
+    }
     for i in 0..list.len() {
         let Some((save, reg, code, lane)) = parks[i] else {
             continue;
         };
         let Some(slot) = code_of(reg, lane) else { return Vec::new() };
-        if pairs.contains(&(reg, lane)) {
-            let Some(j) = partner(i) else { return Vec::new() };
+        if let Some(j) = partner_of[i] {
             // A save moves the pair where its second half is saved; a
             // restore where its first half is restored.
             let (at, gone) = if save { (j, i) } else { (i, j) };
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
             edits.push((at, Some((true, dst, src))));
             edits.push((gone, None));
-        } else if lane > 0 && pairs.contains(&(reg, lane - 1)) {
-            // the upper half of a pair: moved with the lower
-        } else {
+        } else if !paired_upper[i] {
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
             edits.push((i, Some((false, dst, src))));
         }
@@ -1787,5 +1823,48 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn paired_lanes_stay_wide_when_a_lane_is_reused_as_a_scalar() {
+        let p = build_words(
+            &[
+                0xD761_0000,
+                (129 << 9) | 4, // v_writelane_b32 v0, s4, 1
+                0xBE88_0380,    // s_mov_b32 s8, 0
+                0xD761_0000,
+                (130 << 9) | 5, // v_writelane_b32 v0, s5, 2
+                0xD760_0004,
+                (129 << 9) | 256, // v_readlane_b32 s4, v0, 1
+                0xD760_0005,
+                (130 << 9) | 256, // v_readlane_b32 s5, v0, 2
+                0xD761_0000,
+                (129 << 9) | 6, // v_writelane_b32 v0, s6, 1
+                0xD760_0007,
+                (129 << 9) | 256, // v_readlane_b32 s7, v0, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let insts = &p.blocks[0].insts;
+        let moves: Vec<(&str, usize, usize)> = insts
+            .iter()
+            .filter(|i| i.name().starts_with("s_mov_b"))
+            .map(|i| (i.name(), i.reads.len(), i.writes.len()))
+            .collect();
+        assert_eq!(
+            moves,
+            [
+                ("s_mov_b32", 0, 1), // s8 = 0
+                ("s_mov_b64", 2, 2), // save s[4:5]
+                ("s_mov_b64", 2, 2), // restore s[4:5]
+                ("s_mov_b32", 1, 1), // save s6
+                ("s_mov_b32", 1, 1), // restore s7
+            ]
+        );
+        // s[4:5] and s7 read back from the paired and singleton slots written above.
+        assert_eq!(insts[2].reads, insts[1].writes);
+        assert_eq!(insts[3].read(Reg::S(6)), Some(input(&p, Reg::S(6))));
+        assert_eq!(insts[4].reads, insts[3].writes);
     }
 }
