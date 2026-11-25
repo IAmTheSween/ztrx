@@ -1740,4 +1740,85 @@ mod barycentric_tests {
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
+
+    #[test]
+    fn image_descriptor_dimensions_without_image_ops_lower_and_validate() {
+        let [e0, e1] = exp_mrt0(0);
+        // Load an 8-dword texture descriptor without any image_*, read its
+        // width bitfields (s9 >> 30 | ((s10 & 0x3fff) << 2)), and export it.
+        let run = |root: RootType, load_word0: u32| {
+            let words = [
+                0xBE81_0380, // s_mov_b32 s1, 0
+                load_word0,
+                0xFA00_0000, // s_load_dwordx{8,4} s[8:..], s[0:1], 0
+                0x9002_9E09, // s_lshr_b32 s2, s9, 30
+                0x8F03_820A, // s_lshl_b32 s3, s10, 2
+                0x8802_0302, // s_or_b32 s2, s2, s3
+                0x7E00_0202, // v_mov_b32 v0, s2
+                e0,
+                e1,
+                S_ENDPGM,
+            ];
+            let used = if root == RootType::Table {
+                vec![crate::native::UsedResource {
+                    kind: crate::native::ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: 0,
+                    slot: 0,
+                }]
+            } else {
+                vec![]
+            };
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 2,
+                layout: vec![crate::native::RootParam {
+                    root,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used,
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let mut target = element("SV_Target", 16, 0);
+            target.usage = 15;
+            let osg1 = container::signature(&[target], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.code, false, native.vgprs).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            emit(&c, &native, &p, &st, &io, &res)
+        };
+        for root in [RootType::ResourceHeap, RootType::Table] {
+            let shader = run(root, 0xF40C_0200).unwrap(); // s_load_dwordx8 s[8:15], s[0:1], 0
+            validate(&shader);
+        }
+        // A 4-dword ResourceHeap load is not an 8-dword image descriptor.
+        match run(RootType::ResourceHeap, 0xF408_0200) {
+            Err(ShaderError::Unsupported {
+                what: "a descriptor read only as data",
+                ..
+            }) => {}
+            other => panic!(
+                "expected 4-dword heap load without uses to fail, got {:?}",
+                other.err()
+            ),
+        }
+    }
 }
