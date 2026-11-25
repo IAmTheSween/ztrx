@@ -107,6 +107,12 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+/// `s_sendmsg` id marking the end of a PS ordered (POPS) section.
+const MSG_ORDERED_PS_DONE: u16 = 7;
+/// `Operand::Const` id of `src_pops_exiting_wave_id`.
+const POPS_EXITING_WAVE_ID: u8 = 239;
+/// `HW_REG_POPS_PACKER` id in `s_setreg_b32`.
+const HW_REG_POPS_PACKER: u16 = 25;
 
 /// The f16 bits of inline float constant `c` (240..=248: 0.5, -0.5, 1.0,
 /// -1.0, 2.0, -2.0, 4.0, -4.0, 1/(2 pi)).
@@ -220,6 +226,10 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// Pixel shader with RDNA2 POPS (`MSG_ORDERED_PS_DONE`), lowered as ROV.
+    pops: bool,
+    /// Hardware SGPR carrying POPS wave overlap info for a POPS pixel shader.
+    pops_sgpr: Option<u8>,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -1221,6 +1231,62 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
     partners
 }
 
+/// The entry SGPR carrying the POPS wave-overlap state: the one reaching
+/// `s_setreg_b32 hwreg(HW_REG_POPS_PACKER, ...)`.
+fn find_pops_sgpr(p: &Program) -> Option<u8> {
+    let mut inst_uses: HashMap<Value, Vec<&Inst>> = HashMap::new();
+    let mut phi_uses: HashMap<Value, Vec<Value>> = HashMap::new();
+    for block in &p.blocks {
+        for phi in &block.phis {
+            for &a in &phi.args {
+                phi_uses.entry(a).or_default().push(phi.value);
+            }
+        }
+        for inst in &block.insts {
+            for &(_, v) in &inst.reads {
+                inst_uses.entry(v).or_default().push(inst);
+            }
+        }
+    }
+    for &(reg, v) in &p.inputs {
+        let Reg::S(n) = reg else {
+            continue;
+        };
+        if n > 105 {
+            continue;
+        }
+        let mut seen = HashSet::from([v]);
+        let mut work = vec![v];
+        while let Some(cur) = work.pop() {
+            if let Some(insts) = inst_uses.get(&cur) {
+                for inst in insts {
+                    if inst.name() == "s_setreg_b32"
+                        && matches!(
+                            inst.fields,
+                            Fields::Sop { imm: Some(imm), .. } if imm & 0x3F == HW_REG_POPS_PACKER
+                        )
+                    {
+                        return Some(n);
+                    }
+                    for &(_, w) in &inst.writes {
+                        if seen.insert(w) {
+                            work.push(w);
+                        }
+                    }
+                }
+            }
+            if let Some(phis) = phi_uses.get(&cur) {
+                for &w in phis {
+                    if seen.insert(w) {
+                        work.push(w);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -1462,6 +1528,12 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let pops = s.pixel
+            && insts().any(|i| {
+                i.name() == "s_sendmsg"
+                    && matches!(i.fields, Fields::Sopp { imm } if imm & 0xF == MSG_ORDERED_PS_DONE)
+            });
+        let pops_sgpr = pops.then(|| find_pops_sgpr(p)).flatten();
         Lower {
             s,
             x,
@@ -1499,6 +1571,8 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            pops,
+            pops_sgpr,
             src0: None,
             console_lanes,
             split_lds,
@@ -2164,6 +2238,9 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    // POPS overlap wave state: 0 signals no wait (the host's ROV
+                    // handle ordering enforces serialization in hardware).
+                    None if Some(n) == self.pops_sgpr => Val::I32(self.s.m.i32(0)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -3016,6 +3093,7 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            Operand::Const(POPS_EXITING_WAVE_ID) if self.pops => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -8906,7 +8984,8 @@ impl<'a> Lower<'a> {
             || self
                 .used_kind(src)
                 .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        let rov = if self.pops { 0x2000 } else { 0 };
+        let props = (kind | if uav { 0x1000 | rov } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
@@ -8963,7 +9042,7 @@ impl<'a> Lower<'a> {
             } else {
                 original
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, component))?;
+            let h = self.handle(site, src, false, (kind | 0x1000 | rov, component))?;
             let mut args = vec![h];
             let (intrinsic, opcode) = if compare {
                 let comparand = if wide {

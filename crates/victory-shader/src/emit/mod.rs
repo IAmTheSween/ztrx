@@ -1740,4 +1740,102 @@ mod barycentric_tests {
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
+
+    #[test]
+    fn pops_pixel_wait_lowers_and_validates() {
+        let [e0, e1] = exp_mrt0(0);
+        let run = |sendmsg: u32| {
+            let words = [
+                0xBEFE_0A7E, // s_wqm_b64 exec, exec
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0x9381_FF12,
+                0x0002_001C, // s_bfe_u32 s1, s18, 0x0002001c
+                0x9382_FF12,
+                0x000A_0000, // s_bfe_u32 s2, s18, 0x000a0000
+                0x9385_FF12,
+                0x000A_0010, // s_bfe_u32 s5, s18, 0x000a0010
+                0xBE84_0702, // s_not_b32 s4, s2
+                0x9000_9F12, // s_lshr_b32 s0, s18, 31
+                0x8801_8101, // s_or_b32 s1, s1, 1
+                0x8105_0405, // s_add_i32 s5, s5, s4
+                0xBF06_8000, // s_cmp_eq_u32 s0, 0
+                0xB981_1019, // s_setreg_b32 hwreg(HW_REG_POPS_PACKER, 0, 3), s1
+                0x8580_807E, // s_cselect_b64 s[0:1], exec, 0
+                0x8102_04EF, // s_add_i32 s2, src_pops_exiting_wave_id, s4
+                0xBF08_0502, // s_cmp_gt_u32 s2, s5
+                0x8582_807E, // s_cselect_b64 s[2:3], exec, 0
+                0x8880_0200, // s_or_b64 s[0:1], s[0:1], s[2:3]
+                0x87EA_007E, // s_and_b64 vcc, exec, s[0:1]
+                0xBF87_0004, // s_cbranch_vccnz +4
+                0xBF8E_FFFF, // s_sleep 0xffff
+                0x8100_04EF, // s_add_i32 s0, src_pops_exiting_wave_id, s4
+                0xBF0A_0005, // s_cmp_lt_u32 s5, s0
+                0xBF84_FFFC, // s_cbranch_scc0 -4
+                0xF40C_0304,
+                0xFA00_0000, // s_load_dwordx8 s[12:19], s[8:9], 0
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xF000_3F88,
+                0x0003_0000, // image_load v[0:3], v[0:1], s[12:19] dmask:0xf dim:2D unorm glc
+                0xF020_3F08,
+                0x0003_0000, // image_store v[0:3], v[0:1], s[12:19] dmask:0xf dim:2D unorm glc
+                sendmsg,
+                e0,
+                e1,
+                S_ENDPGM,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: true,
+                vgprs: 4,
+                layout: vec![crate::native::RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 8,
+                    slot: 0,
+                }],
+                used: vec![crate::native::UsedResource {
+                    kind: crate::native::ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: 8,
+                    slot: 0,
+                }],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let mut target = element("SV_Target", 16, 0);
+            target.usage = 15;
+            let osg1 = container::signature(&[target], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            emit(&c, &native, &p, &st, &io, &res)
+        };
+        match run(0xBF80_0000) {
+            Err(ShaderError::Unsupported {
+                what: "a hardware SGPR input",
+                ..
+            }) => {}
+            other => panic!(
+                "expected hardware SGPR input refusal without MSG_ORDERED_PS_DONE, got {:?}",
+                other.err()
+            ),
+        }
+        let shader = run(0xBF90_0007).unwrap(); // MSG_ORDERED_PS_DONE
+        validate(&shader);
+    }
 }
